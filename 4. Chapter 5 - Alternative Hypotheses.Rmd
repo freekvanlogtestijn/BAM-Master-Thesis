@@ -1,0 +1,730 @@
+---
+title: "Chapter 5: Alternative Hypotheses"
+output: html_notebook
+---
+
+```{r}
+suppressPackageStartupMessages({
+  library("bigrquery")
+  library("dplyr")
+  library("CLVTools")
+  library("ggplot2")
+  library("DescTools")
+  library("ddpcr")
+  library("tidymodels")
+  library("NbClust")
+  library("GGally")
+  library("stringr")
+  library("ggtext")
+  library("betareg")
+  library("fitdistrplus")
+  library("corrplot")
+  library("mgcv")
+  library("margins")
+  library("lmtest")
+  library("stargazer")
+  library("patchwork")
+  library("prediction")
+})
+```
+
+```{r}
+function.cross.measures <- function(transactions.list, shop.list){
+  
+  # Create an empty dataframe, with set column names
+  cross.measures_shop <- data.frame(matrix(ncol=35, nrow=0))
+  
+  names(cross.measures_shop) <- c("shop", "cohort", "n_members",
+                         "mean.PAlive", "mean.CET",
+                         "ATS.mean.PAlive", "ATS.mean.CET", "n.ATS",
+                         "AR.mean.PAlive", "AR.mean.CET", "n.AR",
+                         "CLT.mean.PAlive", "CLT.mean.CET", "n.CLT",
+                         "C.mean.PAlive", "C.mean.CET", "n.C",
+                         "H.mean.PAlive", "H.mean.CET", "n.H",
+                         "LC.mean.PAlive", "LC.mean.CET", "n.LC",
+                         "NA.mean.PAlive", "NA.mean.CET", "n.NA",
+                         "NC.mean.PAlive", "NC.mean.CET", "n.NC",
+                         "PL.mean.PAlive", "PL.mean.CET", "n.PL",
+                         "P.mean.PAlive", "P.mean.CET", "n.P")
+  
+  count <- 0
+  
+  for (shop in sh_id) { 
+    
+    count <- count + 1
+    print(paste0(count, ": shop_id ", shop))
+    
+    # Data-preparation
+    temp.shop.df <- transactions_df %>%
+      mutate(date = as.Date(created_at, format="%Y-%m-%d", origin = "1970-01-01")) %>%
+      filter(shop_id == shop) # SHOP_ID
+    
+    # Only keep the transactions which were at least one euro
+    temp.shop.df <- filter(temp.shop.df, purchase_amount > 0.99) 
+    
+    ## Remove rows where "member_id" is NA
+    temp.shop.df <- temp.shop.df[complete.cases(temp.shop.df$member_id),]
+    temp.shop.df <- temp.shop.df[complete.cases(temp.shop.df$purchase_amount),]
+    
+    ## Winsorize to get out the extreme values
+    temp.shop.df <- temp.shop.df %>%
+      mutate(purchase_amount = Winsorize(temp.shop.df$purchase_amount, probs = c(0, 0.99)))
+    
+    ## Order by member_id and created_at
+    temp.shop.df <- temp.shop.df[order(temp.shop.df$member_id, temp.shop.df$created_at),]
+    
+    ## Only keep member_id's who have transactions on more than one day
+    temp.shop.df <- temp.shop.df %>%
+      group_by(member_id) %>%
+      filter(n_distinct(date) > 1) %>% # Each customer should have at least two transactions in order for the model to work
+      mutate(quarter = paste(format(min(date), format="%Y"), quarters(min(date)), sep="-")) %>% # Create quarters of first transaction for cohort creation
+      ungroup()
+    
+    quarterlist <- sort(unique(temp.shop.df$quarter))
+    quarterlist <- quarterlist[quarterlist != "2022-Q2"] 
+    
+    if (length(unique(temp.shop.df$member_id)) > 500) {
+      if ((max(temp.shop.df$date) - min(temp.shop.df$date)) > 365) {
+        
+        print(paste0("calculating"))
+        
+        for (cohort in sort(quarterlist)){
+          
+          cohort_df <- temp.shop.df %>% filter(quarter == cohort)
+          
+          if (max(cohort_df$date) - min(cohort_df$date) > 7){
+            
+            # Create the clv.data object
+            temp.clv <- clvdata(cohort_df,
+                                date.format = "ymd",
+                                time.unit = "week",
+                                estimation.split = NULL,
+                                name.id = "member_id",
+                                name.date = "date",
+                                name.price = "purchase_amount")
+            
+            temp.clv@clv.time@timepoint.estimation.end <- as.Date("2022-04-26")
+            
+            # Set seed to initialize random number generator
+            set.seed(1)
+            
+            # Estimate the model parameters
+            quiet(
+              temp.est.bgnbd <- bgnbd(temp.clv,
+                                      start.params.model = c(r=0.275, 
+                                                             alpha=3.287, 
+                                                             a=0.355, 
+                                                             b=2.360),
+                                      optimx.args = list(method="Nelder-Mead"))
+              )
+            
+            temp.kkt1 <- temp.est.bgnbd@optimx.estimation.output[["kkt1"]]
+            temp.kkt2 <- temp.est.bgnbd@optimx.estimation.output[["kkt2"]]
+            temp.conv <- temp.est.bgnbd@optimx.estimation.output[["convcode"]]
+            
+            if (is.na(temp.kkt1)){
+              temp.kkt1 <- FALSE
+            }
+            
+            if (is.na(temp.kkt2)){
+              temp.kkt2 <- FALSE
+            }
+            
+            if (temp.kkt1 == TRUE & temp.kkt2 == TRUE & temp.conv == 0) {
+              
+              quiet(
+                temp.results <- tryCatch(predict(temp.est.bgnbd, prediction.end = 4), error = function(e) e)
+                )
+              
+              if(!inherits(temp.results, "error")) {
+                
+                print(paste0(count,": calculating ", cohort))
+                
+                temp.cbs <- temp.est.bgnbd@cbs
+                
+                # Create R_score and F_score based on 't.x' and 'x'
+                temp.cbs$T.cal_t.x <- temp.cbs$T.cal - temp.cbs$t.x
+                
+                temp.cbs <- temp.cbs %>%
+                  mutate(R_score.alt = ntile(desc(T.cal_t.x), 5),
+                         F_score.alt = ntile(x, 5))
+                
+                # Create Segments based on R_score and F_score
+                temp.cbs <- temp.cbs %>%
+                  mutate(RFM_type = ifelse(R_score.alt %in% c(1, 2) & F_score.alt %in% c(1, 2), "Hibernating",
+                                            ifelse(R_score.alt %in% c(1, 2) & F_score.alt %in% c(3, 4), "At Risk",
+                                            ifelse(R_score.alt %in% c(1, 2) & F_score.alt %in% c(5), "Can't Lose Them",
+                                            ifelse(R_score.alt %in% c(3) & F_score.alt %in% c(1, 2), "About To Sleep",
+                                            ifelse(R_score.alt %in% c(3) & F_score.alt %in% c(3), "Need Attention",
+                                            ifelse(R_score.alt %in% c(3, 4) & F_score.alt %in% c(4, 5), "Loyal Customers",
+                                            ifelse(R_score.alt %in% c(5) & F_score.alt %in% c(4), "Loyal Customers",
+                                            ifelse(R_score.alt %in% c(4) & F_score.alt %in% c(1), "Promising",
+                                            ifelse(R_score.alt %in% c(4, 5) & F_score.alt %in% c(2, 3), "Potential Loyalists",
+                                            ifelse(R_score.alt %in% c(5) & F_score.alt %in% c(1), "New Customers",
+                                            ifelse(R_score.alt %in% c(5) & F_score.alt %in% c(1), "New Customers",
+                                            ifelse(R_score.alt %in% c(5) & F_score.alt %in% c(5), "Champions", "Other"
+                                                   )))))))))))))
+                
+                # Merge the created segments and recency frequency measures to the results
+                temp.results <- merge(temp.results, temp.cbs, by="Id")
+                
+                # Summarise the 'mean' latent attrition and CET, and number of customers
+                mean.PAlive      <- mean(temp.results$PAlive)
+                mean.CET         <- mean(temp.results$CET)
+                n_members        <- nrow(temp.results)
+                
+                # Summarise the 'mean' PAlive for each created segment
+                ATS.mean.PAlive <- as.numeric(temp.results %>%
+                                                filter(RFM_type == "About To Sleep") %>%
+                                                summarize(mean(PAlive)))
+                AR.mean.PAlive  <- as.numeric(temp.results %>%
+                                                filter(RFM_type == "At Risk") %>%
+                                                summarize(mean(PAlive)))
+                CLT.mean.PAlive <- as.numeric(temp.results %>%
+                                                filter(RFM_type == "Can't Lose Them") %>%
+                                                summarize(mean(PAlive)))
+                C.mean.PAlive   <- as.numeric(temp.results %>%
+                                                filter(RFM_type == "Champions") %>%
+                                                summarize(mean(PAlive)))
+                H.mean.PAlive   <- as.numeric(temp.results %>%
+                                                filter(RFM_type == "Hibernating") %>%
+                                                summarize(mean(PAlive)))   
+                LC.mean.PAlive  <- as.numeric(temp.results %>%
+                                                filter(RFM_type == "Loyal Customers") %>%
+                                                summarize(mean(PAlive)))     
+                NA.mean.PAlive  <- as.numeric(temp.results %>%
+                                                filter(RFM_type == "Need Attention") %>%
+                                                summarize(mean(PAlive)))         
+                NC.mean.PAlive  <- as.numeric(temp.results %>%
+                                                filter(RFM_type == "New Customers") %>%
+                                                summarize(mean(PAlive)))  
+                PL.mean.PAlive  <- as.numeric(temp.results %>%
+                                                filter(RFM_type == "Potential Loyalists") %>%
+                                                summarize(mean(PAlive)))
+                P.mean.PAlive   <- as.numeric(temp.results %>%
+                                                filter(RFM_type == "Promising") %>%
+                                                summarize(mean(PAlive)))
+                
+                # Summarise the 'mean' CET for each created segment
+                ATS.mean.CET    <- as.numeric(temp.results %>%
+                                                filter(RFM_type == "About To Sleep") %>%
+                                                summarize(mean(CET)))
+                AR.mean.CET     <- as.numeric(temp.results %>%
+                                                filter(RFM_type == "At Risk") %>%
+                                                summarize(mean(CET)))
+                CLT.mean.CET    <- as.numeric(temp.results %>%
+                                                filter(RFM_type == "Can't Lose Them") %>%
+                                                summarize(mean(CET)))
+                C.mean.CET      <- as.numeric(temp.results %>%
+                                                filter(RFM_type == "Champions") %>%
+                                                summarize(mean(CET)))     
+                H.mean.CET      <- as.numeric(temp.results %>%
+                                                filter(RFM_type == "Hibernating") %>%
+                                                summarize(mean(CET)))        
+                LC.mean.CET     <- as.numeric(temp.results %>%
+                                                filter(RFM_type == "Loyal Customers") %>%
+                                                summarize(mean(CET)))          
+                NA.mean.CET     <- as.numeric(temp.results %>%
+                                                filter(RFM_type == "Need Attention") %>%
+                                                summarize(mean(CET))) 
+                NC.mean.CET     <- as.numeric(temp.results %>%
+                                                filter(RFM_type == "New Customers") %>%
+                                                summarize(mean(CET)))  
+                PL.mean.CET     <- as.numeric(temp.results %>%
+                                                filter(RFM_type == "Potential Loyalists") %>%
+                                                summarize(mean(CET)))
+                P.mean.CET      <- as.numeric(temp.results %>%
+                                                filter(RFM_type == "Promising") %>%
+                                                summarize(mean(CET))) 
+                
+                # Extract the number of customers in each segment
+                n.ATS  <- nrow(filter(temp.results, RFM_type == "About To Sleep"))
+                n.AR   <- nrow(filter(temp.results, RFM_type == "At Risk"))
+                n.CLT  <- nrow(filter(temp.results, RFM_type == "Can't Lose Them"))
+                n.C    <- nrow(filter(temp.results, RFM_type == "Champions"))
+                n.H    <- nrow(filter(temp.results, RFM_type == "Hibernating"))
+                n.LC   <- nrow(filter(temp.results, RFM_type == "Loyal Customers"))
+                n.NA   <- nrow(filter(temp.results, RFM_type == "Need Attention"))
+                n.NC   <- nrow(filter(temp.results, RFM_type == "New Customers"))
+                n.PL   <- nrow(filter(temp.results, RFM_type == "Potential Loyalists"))
+                n.P    <- nrow(filter(temp.results, RFM_type == "Promising"))
+                
+                # Put the measures into a temporary dataframe
+                temp.measures <- as.data.frame(cbind(shop, cohort, n_members,
+                                                     mean.PAlive, mean.CET, 
+                                                     ATS.mean.PAlive, ATS.mean.CET, n.ATS, 
+                                                     AR.mean.PAlive, AR.mean.CET, n.AR,
+                                                     CLT.mean.PAlive, CLT.mean.CET, n.CLT,
+                                                     C.mean.PAlive, C.mean.CET, n.C,
+                                                     H.mean.PAlive, H.mean.CET, n.H,
+                                                     LC.mean.PAlive, LC.mean.CET, n.LC,
+                                                     NA.mean.PAlive, NA.mean.CET, n.NA,
+                                                     NC.mean.PAlive, NC.mean.CET, n.NC,
+                                                     PL.mean.PAlive, PL.mean.CET, n.PL,
+                                                     P.mean.PAlive, P.mean.CET,  n.P))
+                
+                # Append the temporary dataframe to the final dataframe
+                cross.measures_shop <- rbind(cross.measures_shop, temp.measures)
+                
+              
+              }else(print(paste0(count, ": ", cohort, " not predicted: that weird error")))
+            }else(print(paste0(count, ": ", cohort, " not predicted: kkt or conv not met")))
+          }else(print(paste0(count, ": ", cohort, " not predicted: less than a week from prediction")))
+        }
+      }else(print(paste0(count, ": shop_id ", shop, " not predicted: exists for less than a year")))
+    }else(print(paste0(count, ": shop_id ", shop, " not predicted: too little members")))
+  }
+  
+  # Rename shop to "shop_id"
+  names(cross.measures_shop)[names(cross.measures_shop) == "shop"] <- "shop_id"
+  
+  # Merge loyalty_program_id to each shop - necessary for merging the rewards
+  cross.measures_shop <- merge(cross.measures_shop, shops_df[c("shop_id", "loyalty_program_id")], by = "shop_id")
+  
+  return(cross.measures_shop)
+}
+```
+
+```{r}
+cross.measures <- function.cross.measures(transactions_df, sh_id)
+```
+
+```{r}
+# Calculate the mean of each metric per segment over all the cohorts
+cross.measures.summary <- cross.measures %>% group_by(shop_id) %>%
+  mutate(wMean.PAlive = as.numeric(mean.PAlive)*as.numeric(n_members)/sum(as.numeric(n_members)),
+         wMean.CET = as.numeric(mean.CET)*as.numeric(n_members)/sum(as.numeric(n_members)),
+         
+         wATS.PAlive = as.numeric(ATS.mean.PAlive)*as.numeric(n.ATS)/sum(as.numeric(n.ATS)),
+         wATS.CET = as.numeric(ATS.mean.CET)*as.numeric(n.ATS)/sum(as.numeric(n.ATS)),
+         
+         wAR.PAlive = as.numeric(AR.mean.PAlive)*as.numeric(n.AR)/sum(as.numeric(n.AR)),
+         wAR.CET = as.numeric(AR.mean.CET)*as.numeric(n.AR)/sum(as.numeric(n.AR)),
+         
+         wCLT.PAlive = as.numeric(CLT.mean.PAlive)*as.numeric(n.CLT)/sum(as.numeric(n.CLT)),
+         wCLT.CET = as.numeric(CLT.mean.CET)*as.numeric(n.CLT)/sum(as.numeric(n.CLT)),
+         
+         wC.PAlive = as.numeric(C.mean.PAlive)*as.numeric(n.C)/sum(as.numeric(n.C)),
+         wC.CET = as.numeric(C.mean.CET)*as.numeric(n.C)/sum(as.numeric(n.C)),
+         
+         wH.PAlive = as.numeric(H.mean.PAlive)*as.numeric(n.H)/sum(as.numeric(n.H)),
+         wH.CET = as.numeric(H.mean.CET)*as.numeric(n.H)/sum(as.numeric(n.H)),
+         
+         wLC.PAlive = as.numeric(LC.mean.PAlive)*as.numeric(n.LC)/sum(as.numeric(n.LC)),
+         wLC.CET = as.numeric(LC.mean.CET)*as.numeric(n.LC)/sum(as.numeric(n.LC)),
+         
+         wNA.PAlive = as.numeric(NA.mean.PAlive)*as.numeric(n.NA)/sum(as.numeric(n.NA)),
+         wNA.CET = as.numeric(NA.mean.CET)*as.numeric(n.NA)/sum(as.numeric(n.NA)),
+         
+         wNC.PAlive = as.numeric(NC.mean.PAlive)*as.numeric(n.NC)/sum(as.numeric(n.NC)),
+         wNC.CET = as.numeric(NC.mean.CET)*as.numeric(n.NC)/sum(as.numeric(n.NC)),
+         
+         wPL.PAlive = as.numeric(PL.mean.PAlive)*as.numeric(n.PL)/sum(as.numeric(n.PL)),
+         wPL.CET = as.numeric(PL.mean.CET)*as.numeric(n.PL)/sum(as.numeric(n.PL)),
+         
+         wP.PAlive = as.numeric(P.mean.PAlive)*as.numeric(n.P)/sum(as.numeric(n.P)),
+         wP.CET = as.numeric(P.mean.CET)*as.numeric(n.P)/sum(as.numeric(n.P))) %>%
+  
+  summarise(PAlive.mean = sum(wMean.PAlive, na.rm=TRUE),
+            PAlive.ATS = sum(wATS.PAlive, na.rm=TRUE),
+            PAlive.AR = sum(wAR.PAlive, na.rm=TRUE),
+            PAlive.CLT = sum(wCLT.PAlive, na.rm=TRUE),
+            PAlive.C = sum(wC.PAlive, na.rm=TRUE),
+            PAlive.H = sum(wH.PAlive, na.rm=TRUE),
+            PAlive.LC = sum(wLC.PAlive, na.rm=TRUE),
+            PAlive.NA = sum(wNA.PAlive, na.rm=TRUE),
+            PAlive.NC = sum(wNC.PAlive, na.rm=TRUE),
+            PAlive.PL = sum(wPL.PAlive, na.rm=TRUE),
+            PAlive.P = sum(wP.PAlive, na.rm=TRUE),
+            CET.mean = sum(wMean.CET, na.rm=TRUE),
+            CET.ATS = sum(wATS.CET, na.rm=TRUE),
+            CET.AR = sum(wAR.CET, na.rm=TRUE),
+            CET.CLT = sum(wCLT.CET, na.rm=TRUE),
+            CET.C = sum(wC.CET, na.rm=TRUE),
+            CET.H = sum(wH.CET, na.rm=TRUE),
+            CET.LC = sum(wLC.CET, na.rm=TRUE),
+            CET.NA = sum(wNA.CET, na.rm=TRUE),
+            CET.NC = sum(wNC.CET, na.rm=TRUE),
+            CET.PL = sum(wPL.CET, na.rm=TRUE),
+            CET.P = sum(wP.CET, na.rm=TRUE)
+            )
+
+# Create a long dataframe of all the measures
+cross.measures.long <- merge(pivot_longer(cross.measures.summary[,1:12], c(2:12), 
+                                          names_to = c("segment"),
+                                          names_prefix = c("PAlive."),
+                                          values_to = c("PAlive")),
+                             pivot_longer(cross.measures.summary[,c(1,13:23)], c(2:12), 
+                                          names_to = c("segment"),
+                                          names_prefix = c("CET."),
+                                          values_to = c("CET")), by = c("shop_id", "segment"))
+
+cross.measures.long <- merge(cross.measures.long, shops_df[c("shop_id", "loyalty_program_id")], by = "shop_id")
+```
+
+```{r}
+## Calculate the ratio of credits to cost price for each reward
+rewards_df <- rewards_df %>%
+      filter(required_credits > 0) %>%
+      mutate(relative_credits = required_credits / cost_price)
+```
+
+```{r}
+## Create reward structures
+reward_structures <- rewards_df %>% distinct(loyalty_program_id, title, .keep_all = TRUE) %>%
+      group_by(loyalty_program_id) %>% 
+      summarise(num_rewards = n(),
+             min_reward = min(required_credits),
+             min_relative = min(relative_credits),
+             max_reward = max(required_credits),
+             max_relative = max(relative_credits),
+             med_reward = median(required_credits),
+             med_relative = median(relative_credits))
+```
+
+```{r}
+## Extract characteristics of shops included in the cross sectional analysis
+shop.length <- transactions_df %>% 
+  filter(shop_id %in% unique(cross.measures.long$shop_id)) %>%
+  group_by(shop_id) %>%
+  summarise(first_trans = min(as.Date(created_at, format="%Y-%m-%d", origin = "1970-01-01")),
+            last_trans = as.Date("2022-04-26")) %>%
+  mutate(days_active = as.integer(last_trans - first_trans)) %>%
+  dplyr::select('shop_id', 'days_active')
+
+shop.members <- cross.measures %>% group_by(shop_id) %>%
+  summarise(members = sum(as.numeric(n_members)))
+```
+
+```{r}
+## Create dataframe of cross-section of measures and reward_structures
+final.df.shop_segment <- merge(cross.measures.long, reward_structures, by = "loyalty_program_id")
+
+final.df.shop_segment <- merge(merge(final.df.shop_segment, shop.length, by = "shop_id"),
+                               shop.members, by = "shop_id")
+
+final.df.segments <- filter(final.df.shop_segment, segment != "mean") 
+final.df.segments <- filter(final.df.segments, PAlive != 0)
+
+# Transform variables
+final.df.segments$log.min_reward <- log(final.df.segments$min_reward)
+final.df.segments$CET.wins <- Winsorize(final.df.segments$CET, probs = (c(0.025, 1)))
+```
+
+```{r}
+## Look at correlations
+final.df.segments %>% dplyr::select(PAlive, CET.wins, log.min_reward, min_relative, num_rewards, days_active, members) %>%
+  cor() %>% corrplot(method="number")
+```
+
+```{r}
+## Look at the summary statistics
+final.df.segments %>% dplyr::select(PAlive, CET.wins, log.min_reward, min_relative, num_rewards, days_active, members) %>%
+  summary()
+```
+
+```{r}
+## Run the regressions without interaction terms
+set.seed(0)
+
+mdl.2.1 <- betareg(PAlive ~ log.min_reward + 
+                     segment + num_rewards + days_active + log(members) | shop_id,
+                data=final.df.segments, link = "logit")
+mdl.2.2 <- betareg(PAlive ~ min_relative + 
+                     segment + num_rewards + days_active + log(members) | shop_id,
+                data=final.df.segments, link = "logit")
+mdl.3.1 <- lm(log(CET.wins) ~ log.min_reward + 
+                     segment + num_rewards + days_active + log(members),
+                data=final.df.segments)
+mdl.3.2 <- lm(log(CET.wins) ~ min_relative + 
+                     segment + num_rewards + days_active + log(members),
+                data=final.df.segments)
+```
+
+```{r}
+## Summary of the regressions
+stargazer(mdl.2.1, mdl.2.2, mdl.3.1, mdl.3.2, type = "text")
+```
+
+```{r}
+## Calculate the Average Marginal Effects and create graphs
+quantlist.rew <- quantile(final.df.segments$log.min_reward, probs = c(0.0, 0.05, 0.25, 0.5, 0.75, 0.95, 1))
+quantlist.rel <- quantile(final.df.segments$min_relative, probs = c(0.0, 0.05, 0.25, 0.5, 0.75, 0.95, 1))
+
+# Model 2.1
+summ.margins.2.1 <- summary(margins(mdl.2.1, 
+        data = data.frame(final.df.segments),
+        at = list(log.min_reward = quantlist.rew),
+        variables = "log.min_reward"))
+
+gg.AME.21 <-ggplot(data=summ.margins.2.1, aes(x=log.min_reward, y=AME)) +
+  geom_errorbar(aes(ymin=lower, ymax=upper), width = 0.05) +
+  geom_line() +
+  geom_point() +
+  geom_hline(yintercept = 0, linetype="dotted") +
+  labs(x        = "log(minimum reward size)",
+       y        = "AME of log(minimum reward size)",
+       title    = "Graph 1: AME of log(minimum reward size) on P(Alive)",
+       subtitle = "at important quantiles of log(minimum reward size), with 95% CI's") +  
+  theme_bw()
+
+# Model 2.2
+summ.margins.2.2 <- summary(margins(mdl.2.2, 
+        data = data.frame(final.df.segments),
+        at = list(min_relative = quantlist.rel),
+        variables = "min_relative"))
+
+gg.AME.22 <- ggplot(data=summ.margins.2.2, aes(x=min_relative, y=AME)) +
+  geom_errorbar(aes(ymin=lower, ymax=upper), width = 0.05) +
+  geom_line() +
+  geom_point() +
+  geom_hline(yintercept = 0, linetype="dotted") +
+  labs(x        = "relative reward price",
+       y        = "AME of relative reward price",
+       title    = "Graph 5: AME of relative reward price on P(Alive)",
+       subtitle = "at important quantiles of relative reward price, with 95% CI's") +  
+  theme_bw()
+
+# Model 3.1
+summ.margins.3.1 <- summary(margins(mdl.3.1, 
+        data = data.frame(final.df.segments),
+        at = list(log.min_reward = quantlist.rew),
+        variables = "log.min_reward"))
+
+gg.AME.31 <- ggplot(data=summ.margins.3.1, aes(x=log.min_reward, y=AME)) +
+  geom_errorbar(aes(ymin=lower, ymax=upper), width = 0.05) +
+  geom_line() +
+  geom_point() +
+  geom_hline(yintercept = 0, linetype="dotted") +
+  labs(x        = "log(minimum reward size)",
+       y        = "AME of log(minimum reward size)",
+       title    = "Graph 3: AME of log(minimum reward size) on log(CET)",
+       subtitle = "at important quantiles of log(minimum reward size), with 95% CI's") +  
+  theme_bw()
+
+# Model 3.2
+summ.margins.3.2 <- summary(margins(mdl.3.2, 
+        data = data.frame(final.df.segments),
+        at = list(min_relative = quantlist.rel),
+        variables = "min_relative"))
+
+gg.AME.32 <- ggplot(data=summ.margins.3.2, aes(x=min_relative, y=AME)) +
+  geom_errorbar(aes(ymin=lower, ymax=upper), width = 0.05) +
+  geom_line() +
+  geom_point() +
+  geom_hline(yintercept = 0, linetype="dotted") +
+  labs(x        = "relative reward price",
+       y        = "AME of relative reward price",
+       title    = "Graph 7: AME of relative reward price on log(CET)",
+       subtitle = "at important quantiles of relative reward price, with 95% CI's") +  
+  theme_bw()
+```
+
+```{r}
+## Calculate the Predictive Margins and plot the estimated effects
+# Model 2.1
+predictions.2.1 <- summary(prediction(mdl.2.1, 
+                                      data = data.frame(final.df.segments),
+                                      at = list(log.min_reward = round(quantlist.rew, 1)),
+                                      calculate_se = TRUE))
+
+gg.PRED.21 <- ggplot(data=predictions.2.1, aes(x=`at(log.min_reward)`, y=Prediction)) +
+  geom_line() +
+  geom_point() +
+  geom_hline(yintercept = 0, linetype="dotted") +
+  labs(x        = "log(minimum reward size)",
+       y        = "Predicted Mean of P(Alive)",
+       title    = "Graph 2: Predictive Margins of P(Alive)",
+       subtitle = "at important quantiles of log(minimum reward size)") +  
+  theme_bw()
+
+# Model 2.2
+predictions.2.2 <- summary(prediction(mdl.2.2, 
+                                      data = data.frame(final.df.segments),
+                                      at = list(min_relative = round(quantlist.rel, 1)),
+                                      calculate_se = TRUE))
+
+gg.PRED.22 <- ggplot(data=predictions.2.2, aes(x=`at(min_relative)`, y=Prediction)) +
+  geom_line() +
+  geom_point() +
+  geom_hline(yintercept = 0, linetype="dotted") +
+  labs(x        = "relative reward price",
+       y        = "Predicted Mean of P(Alive)",
+       title    = "Graph 6: Predictive Margins of P(Alive)",
+       subtitle = "at important quantiles of relative reward price") +  
+  theme_bw()
+
+# Model 3.1
+predictions.3.1 <- summary(prediction(mdl.3.1, 
+                                      data = data.frame(final.df.segments),
+                                      at = list(log.min_reward = round(quantlist.rew, 1)),
+                                      calculate_se = TRUE))
+
+gg.PRED.31 <- ggplot(data=predictions.3.1, aes(x=`at(log.min_reward)`, y=exp(Prediction))) +
+  geom_line() +
+  geom_point() +
+  geom_hline(yintercept = 0, linetype="dotted") +
+  labs(x        = "log(minimum reward size)",
+       y        = "Predicted Mean of CET",
+       title    = "Graph 4: Predictive Margins of CET",
+       subtitle = "at important quantiles of log(minimum reward size)") +  
+  theme_bw()
+
+# Model 3.2
+predictions.3.2 <- summary(prediction(mdl.3.2, 
+                                      data = data.frame(final.df.segments),
+                                      at = list(min_relative = round(quantlist.rel, 1)),
+                                      calculate_se = TRUE))
+
+gg.PRED.32 <- ggplot(data=predictions.3.2, aes(x=`at(min_relative)`, y=exp(Prediction))) +
+  geom_line() +
+  geom_point() +
+  geom_hline(yintercept = 0, linetype="dotted") +
+  labs(x        = "relative reward price",
+       y        = "Predicted Mean of CET",
+       title    = "Graph 8: Predictive Margins of CET",
+       subtitle = "at important quantiles of relative reward price") +  
+  theme_bw()
+```
+
+```{r}
+# Show plots
+graphs2 <- (gg.AME.21 + gg.PRED.21) / (gg.AME.31 + gg.PRED.31) / (gg.AME.22 + gg.PRED.22)  / (gg.AME.32 + gg.PRED.32)
+
+graphs2
+
+ggsave(graphs2, filename = "eight_graphs.png", width = 15.2, height = 19)
+```
+
+```{r}
+## Look at the effect of an increase of the covariate on the dependent variable from the 25th to the 75th percentile
+predictions.2.1 %>% filter(row_number() %in% c(3, 5)) %>%
+  summarise(pct.difference = round(last(Prediction) / first(Prediction) - 1 , 3),
+            abs.difference = round(last(Prediction) - first(Prediction), 3))
+
+predictions.3.1 %>% filter(row_number() %in% c(3, 5)) %>%
+  summarise(pct.difference = round(exp(last(Prediction)) / exp(first(Prediction)) - 1 , 3),
+            abs.difference = round(exp(last(Prediction)) - exp(first(Prediction)), 3))
+
+predictions.2.2 %>% filter(row_number() %in% c(3, 5)) %>%
+  summarise(pct.difference = round(last(Prediction) / first(Prediction) - 1 , 3),
+            abs.difference = round(last(Prediction) - first(Prediction), 3))
+
+predictions.3.2 %>% filter(row_number() %in% c(3, 5)) %>%
+  summarise(pct.difference = round(exp(last(Prediction)) / exp(first(Prediction)) - 1 , 3),
+            abs.difference = round(exp(last(Prediction)) - exp(first(Prediction)), 3))
+```
+
+```{r}
+# Run the regressions with the interaction terms
+set.seed(0)
+
+mdl.2.3 <- betareg(PAlive ~ log.min_reward*segment + 
+                     num_rewards + days_active + log(members) | shop_id,
+                data=final.df.segments, link = "logit")
+mdl.2.4 <- betareg(PAlive ~ min_relative*segment + 
+                     num_rewards + days_active + log(members) | shop_id,
+                data=final.df.segments, link = "logit")
+mdl.3.3 <- lm(log(CET.wins) ~ log.min_reward*segment + 
+                     num_rewards + days_active + log(members),
+                data=final.df.segments)
+mdl.3.4 <- lm(log(CET.wins) ~ min_relative*segment + 
+                     num_rewards + days_active + log(members),
+                data=final.df.segments)
+```
+
+```{r}
+stargazer(mdl.2.3, mdl.2.4, mdl.3.3, mdl.3.4, type = "text")
+```
+
+```{r}
+quantlist.abs <- quantile(final.df.segments$log.min_reward, probs = c(0.25, 0.5, 0.75))
+quantlist.rel <- quantile(final.df.segments$min_relative, probs = c(0.25, 0.5, 0.75))
+
+summ.margins.2.3 <- summary(margins(mdl.2.3, 
+        data = data.frame(final.df.segments),
+        at = list(segment = unique(final.df.segments$segment),
+                  log.min_reward = quantlist.abs),
+        variables = "log.min_reward"),
+        type = "response")
+
+summ.margins.3.3 <- summary(margins(mdl.3.3, 
+        data = data.frame(final.df.segments),
+        at = list(segment = unique(final.df.segments$segment),
+                  log.min_reward = quantlist.abs),
+        variables = "log.min_reward"),
+        type = "response")
+
+summ.margins.2.4 <- summary(margins(mdl.2.4, 
+        data = data.frame(final.df.segments),
+        at = list(segment = unique(final.df.segments$segment),
+                  min_relative = quantlist.rel),
+        variables = "min_relative"),
+        type = "response")
+
+summ.margins.3.4 <- summary(margins(mdl.3.4, 
+        data = data.frame(final.df.segments),
+        at = list(segment = unique(final.df.segments$segment),
+                  min_relative = quantlist.rel),
+        variables = "min_relative"),
+        type = "response")
+```
+
+```{r}
+margins.mdl.2.3 <- ggplot(data=summ.margins.2.3, aes(x=log.min_reward, y=AME)) +
+  geom_errorbar(aes(ymin=lower, ymax=upper), width = 0.5) +
+  geom_point() +
+  facet_wrap(~ segment, ncol = 5) +
+  geom_hline(yintercept = 0, linetype="dotted") +
+  labs(x        = "log(minimum reward size)",
+       y        = "AME of log(minimum reward size)",
+       title    = "Graph 1: AME of log(minimum reward size) on P(Alive)",
+       subtitle = "at important quantiles of log(minimum reward size) for different segments, with 95% CI's") +  
+  theme_bw()
+
+margins.mdl.3.3 <- ggplot(data=summ.margins.3.3, aes(x=log.min_reward, y=AME)) +
+  geom_errorbar(aes(ymin=lower, ymax=upper), width = 0.5) +
+  geom_point() +
+  facet_wrap(~ factor(segment), ncol = 5) +
+  geom_hline(yintercept = 0, linetype="dotted") +
+  labs(x        = "log(minimum reward size)",
+       y        = "AME of log(minimum reward size)",
+       title    = "Graph 2: AME of log(minimum reward size) on log(CET)",
+       subtitle = "at important quantiles of log(minimum reward size) for different segments, with 95% CI's") +  
+  theme_bw()
+
+margins.mdl.2.4 <- ggplot(data=summ.margins.2.4, aes(x=min_relative, y=AME)) +
+  geom_errorbar(aes(ymin=lower, ymax=upper), width = 0.5) +
+  geom_point() +
+  facet_wrap(~ factor(segment), ncol = 5) +
+  geom_hline(yintercept = 0, linetype="dotted") +
+  labs(x        = "relative reward price",
+       y        = "AME of relative reward price",
+       title    = "Graph 3: AME of relative reward price on P(Alive)",
+       subtitle = "at important quantiles of relative reward price) for different segments, with 95% CI's") +  
+  theme_bw()
+
+margins.mdl.3.4 <- ggplot(data=summ.margins.3.4, aes(x=min_relative, y=AME)) +
+  geom_errorbar(aes(ymin=lower, ymax=upper), width = 0.5) +
+  geom_point() +
+  facet_wrap(~ factor(segment), ncol = 5) +
+  geom_hline(yintercept = 0, linetype="dotted") +
+  labs(x        = "relative reward price",
+       y        = "AME of relative reward price",
+       title    = "Graph 4: AME of relative reward price on log(CET)",
+       subtitle = "at important quantiles of relative reward price for different segments, with 95% CI's") +  
+  theme_bw()
+```
+
+```{r}
+int.graphs <- ((margins.mdl.2.3 + margins.mdl.3.3) / (margins.mdl.2.4 + margins.mdl.3.4))
+
+int.graphs
+
+ggsave(int.graphs, filename = "interaction.plots.png", width = 15.2, height = 9.5)
+```
+
+
+
+
+

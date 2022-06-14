@@ -1,0 +1,363 @@
+---
+title: "Chapter 4: The idiosyncratic fit heuristic"
+output: html_notebook
+---
+
+Using BG/NBD model, for each of the loyalty programs which have 500 members or more and are active for at least one year (365 days), the individual customer metrics are estimated. The estimations are made for each loyalty program separately so that the parameters $r, \alpha, a$ and $b$ are estimated separately for each loyalty program.
+
+After the estimation of the consumer level metrics from the BG/NBD model, the individual effort and reference effort slope, and the idiosyncratic fit of the consumer with the loyalty program are calculated and appended to a data frame.
+
+```{r}
+function.indiv.metrics <- function(transactions_df, sh_id, days) {
+
+      indiv.metrics <- data.frame(matrix(ncol=14, nrow=0)) # Create an empty dataframe, with set column names
+        
+      names(indiv.metrics) <- c("shop_id",
+                                "loyalty_program_id",
+                                "cohort",
+                                "member_id",
+                                "recency",
+                                "frequency",
+                                "total.time",
+                                "PAlive",
+                                "PMS",
+                                "CET",
+                                "shop.PMS",
+                                "indiv.effort",
+                                "refer.effort",
+                                "idiosync.fit")
+      
+      count <- 0
+      
+      for (shop in sh_id) { 
+        
+        count <- count + 1 # Create a counter that indicates the progress
+        print(paste0(count, ": shop_id ", shop)) # Print the progress
+        
+        temp.shop.df <- transactions_df %>%
+          mutate(date = as.Date(created_at, format="%Y-%m-%d", origin = "1970-01-01")) %>% # Convert date to correct time format
+          filter((shop_id == shop) & # Only keep the transactions of one single shop, used for further calculations
+                 (purchase_amount > 0.99)) %>% # Only keep the transactions larger than one euro
+          dplyr::select(c(loyalty_program_id, shop_id, member_id, 
+                          created_at, purchase_amount, date)) # Remove redundant columns
+      
+        ## Remove rows where 'member_id', 'credits' or 'purchase_amount' is NA
+        temp.shop.df <- temp.shop.df[complete.cases(temp.shop.df$member_id),]
+        temp.shop.df <- temp.shop.df[complete.cases(temp.shop.df$purchase_amount),]
+          
+        ## Winsorize to get out the extreme values - these are very likely to be faulty data
+        temp.shop.df <- temp.shop.df %>%
+          mutate(purchase_amount = Winsorize(temp.shop.df$purchase_amount, probs = c(0, 0.99)))   
+      
+        ## Order by 'member_id' and 'created_at' - 'created_at' is more precise than 'date'
+        temp.shop.df <- temp.shop.df[order(temp.shop.df$member_id, temp.shop.df$created_at),]
+          
+        temp.shop.df <- temp.shop.df %>%
+          group_by(member_id) %>%
+          filter(n_distinct(date) > 1) %>% # Each customer should have at least two transactions in order for the model to work
+          mutate(quarter = paste(format(min(date), format="%Y"), quarters(min(date)), sep="-")) %>% # Create quarters of first transaction for cohort creation
+          ungroup()
+          
+        quarterlist <- unique(temp.shop.df$quarter)
+        quarterlist <- quarterlist[quarterlist != "2022-Q2"]
+        
+        if (length(unique(temp.shop.df$member_id)) > 500) {
+          if ((max(temp.shop.df$date) - min(temp.shop.df$date)) > 365) {
+            
+
+            for (cohort in sort(quarterlist)){
+              
+              cohort_df <- temp.shop.df %>% filter(quarter == cohort)
+              
+              if (max(cohort_df$date) - min(cohort_df$date) > 7){
+              
+                temp.clv <- clvdata(cohort_df,
+                                    date.format = "ymd",
+                                    time.unit = "day",
+                                    estimation.split = NULL,
+                                    name.id = "member_id",
+                                    name.date = "date",
+                                    name.price = "purchase_amount")
+                
+                temp.clv@clv.time@timepoint.estimation.end <- as.Date("2022-04-26")
+                
+                set.seed(1)
+                     
+                ## Estimate the model parameters
+                quiet(
+                temp.est.bgnbd <- bgnbd(temp.clv, 
+                                        start.params.model = c(r=0.275, 
+                                                               alpha=3.287,
+                                                               a=0.355, 
+                                                               b=2.360),
+                                        optimx.args = list(method="Nelder-Mead")))
+                
+                temp.kkt1 <- temp.est.bgnbd@optimx.estimation.output[["kkt1"]]
+                temp.kkt2 <- temp.est.bgnbd@optimx.estimation.output[["kkt2"]]
+                temp.conv <- temp.est.bgnbd@optimx.estimation.output[["convcode"]]
+                
+                if (is.na(temp.kkt1)){
+                  temp.kkt1 <- FALSE
+                }
+                
+                if (is.na(temp.kkt2)){
+                  temp.kkt2 <- FALSE
+                }
+                
+                if (temp.kkt1 == TRUE & temp.kkt2 == TRUE & temp.conv == 0) {
+                  
+                  quiet(
+                  temp.results <- tryCatch(predict(temp.est.bgnbd, prediction.end = days), error = function(e) e)
+                  )
+                        
+                  if(!inherits(temp.results, "error")) {
+                  
+                    print(paste0(count,": calculating ", cohort))
+                    
+                    temp.cbs <- temp.est.bgnbd@cbs
+                    
+                    temp.cbs$T.cal_t.x <- temp.cbs$T.cal - temp.cbs$t.x
+                    
+                    temp.metrics <- merge(temp.cbs[,c('Id', 'x', 'T.cal_t.x', 'T.cal'),], 
+                                          temp.results[,c('Id', 'PAlive', 'predicted.mean.spending', 'CET')],
+                                          by = 'Id')
+                    
+                    names(temp.metrics) <- c('member_id', 'frequency', 'recency', 'total.time',
+                                             'PAlive', 'PMS', 'CET')
+                    
+                    temp.metrics$shop_id <- shop
+                    
+                    temp.metrics <- merge(temp.metrics, 
+                                          shops_df[,c('shop_id', 'loyalty_program_id')], 
+                                          by = 'shop_id', 
+                                          all.x = TRUE)
+                    
+                    temp.metrics$cohort <- cohort
+                    
+                    temp.metrics <- temp.metrics[,c('shop_id', 'loyalty_program_id', 'cohort', 'member_id',
+                                                    'recency', 'frequency', 'total.time',
+                                                    'PAlive', 'PMS', 'CET')]
+                    
+                    indiv.metrics <- rbind(indiv.metrics, temp.metrics)
+                  }else{print(paste0(count, ": ",cohort, " not predicted: that weird error"))}
+                }else{print(paste0(count, ": ",cohort, " not predicted: kkt or conv not met"))}
+              }else{print(paste0(count, ": ",cohort, " not predicted: less than a week from prediction"))}
+            }
+          }else{print(paste0(count, ": shop_id ",shop, " not predicted: exists for less than a year"))}
+        }else{print(paste0(count, ": shop_id ",shop, " not predicted: too little members"))}
+      }
+      
+      indiv.metrics <- indiv.metrics %>% group_by(shop_id) %>%
+              mutate(indiv.effort = PMS*CET,
+                     shop.PMS = mean(PMS),
+                     shop.CET = mean(CET),
+                     refer.effort = shop.PMS * shop.CET,
+                     idiosync.fit = indiv.effort - refer.effort)
+      
+      return(indiv.metrics)
+}
+```
+
+```{r}
+indiv.metrics <- function.indiv.metrics(transactions_df, sh_id, 28)
+```
+
+After the creation of the individual level metrics, some characteristics from each loyalty program need to be created in order to simulate the program requirements. Since most programs have multiple rewards that can be redeemed within their program in exchange for credits, multiple metrics are extracted from the data. These metrics include the minimum, median, and maximum of the required credits, the required credits divided by the average spending at the store, and the required credits divided by the cost price of the reward (the ratio of credits per euro of cost price). Furthermore, the ratio of credits per euro of cost price is also segmented into four categories.
+
+```{r}
+rewards_df <- merge(rewards_df, 
+                    indiv.metrics %>% 
+                      group_by(shop_id, loyalty_program_id) %>% 
+                      summarize(mean.PMS = mean(shop.PMS)),
+                    by = 'loyalty_program_id')
+
+# Filter out free rewards and create required credits / cost price ratio
+rewards_df <- rewards_df %>%
+      filter(required_credits > 0) %>%
+      mutate(relative_cost = required_credits / cost_price)
+```
+
+```{r}
+reward_structures <- rewards_df %>% distinct(shop_id, title, .keep_all = TRUE) %>%
+      group_by(shop_id) %>%
+      summarise(num_rewards = n(),
+             min_reward = min(required_credits),
+             min_cost = min(relative_cost),
+             max_reward = max(required_credits),
+             max_cost = max(relative_cost),
+             med_reward = median(required_credits),
+             med_cost = median(relative_cost))
+```
+
+The final data frame is constructed by merging the individual consumer metrics with the reward structure metrics of each loyalty program. The resulting data frame consists of one observation per member for each of the loyalty programs that is analysed. Members of the same loyalty program will have differing individual metrics but the same program-level metrics.
+
+```{r}
+## Create final data frame
+final.df <- merge(indiv.metrics[,c('shop_id', 'loyalty_program_id', 'member_id', 'PAlive', 'idiosync.fit')],
+                  reward_structures,
+                  by = 'shop_id')
+
+final.df <- final.df %>%
+        mutate(idiosync.fit = Winsorize(idiosync.fit, probs = c(0, 0.99)))
+
+final.df <- final.df %>% filter(!is.infinite(med_cost) & !is.infinite(max_cost))
+```
+
+```{r}
+## Look at the correlation
+final.df %>% dplyr::select(PAlive, idiosync.fit, med_cost) %>%
+  cor() %>% corrplot(method="number")
+```
+
+```{r}
+## Look at the summary statistics
+final.df %>% dplyr::select(PAlive, idiosync.fit, med_cost) %>%
+  summary()
+```
+
+```{r}
+## Distribution of P(Alive)
+plot(fitdist(final.df$PAlive, "beta")) 
+```
+
+```{r}
+## Estimate the beta regressions 
+set.seed(0)
+
+mdl.1.1   <- betareg(PAlive ~ idiosync.fit*med_cost, 
+                      data=final.df,
+                      link="logit")
+
+mdl.1.2   <- betareg(PAlive ~ idiosync.fit*med_cost | factor(shop_id), 
+                      data=final.df,
+                      link="logit")
+```
+
+```{r}
+## Perform a likelihood ratio test
+lrtest(mdl.1.1, mdl.1.2)
+```
+
+```{r}
+## Look at AIC
+AIC(mdl.1.1, mdl.1.2, k = log(nrow(final.df)))
+```
+
+```{r}
+## Summary of the models
+summary(mdl.1.1, type = 'pearson')
+summary(mdl.1.2, type = 'pearson')
+```
+
+```{r}
+## Average Marginal Effect of Idiosyncratic Fit
+quantlist.fit <- quantile(final.df$idiosync.fit, probs = c(0, 0.05, 0.25, 0.5, 0.75, 0.95, 1))
+
+summ.margins.1.1 <- summary(margins(mdl.1.2, 
+        data = data.frame(final.df),
+        at = list(idiosync.fit = quantlist.fit),
+        variables = "idiosync.fit"))
+
+gg.AMEfit <- ggplot(data=summ.margins.1.1, aes(x=idiosync.fit, y=AME)) +
+  geom_errorbar(aes(ymin=lower, ymax=upper), width = 0.5) +
+  geom_line() +
+  geom_point() +
+  geom_hline(yintercept = 0, linetype="dotted") +
+  labs(x        = "Idiosyncratic Fit",
+       y        = "AME of Idiosyncratic Fit",
+       title    = "Graph 1: Average Marginal Effect (AME) of Idiosyncratic Fit on P(Alive)",
+       subtitle = "at important quantities of  Idiosyncratic Fit, with 95% CI's") +
+  theme(legend.position="bottom") +
+  theme_bw()
+```
+
+```{r}
+## Average marginal effect of Program Requirement
+quantlist.rew <- quantile(final.df$med_cost, probs = c(0.05, 0.25, 0.5, 0.75, 0.95))
+
+summ.margins.1.2 <- summary(margins(mdl.1.2, 
+        data = data.frame(final.df),
+        at = list(med_cost = quantlist.rew),
+        variables = "med_cost"))
+
+gg.AMEratio <- ggplot(data=summ.margins.1.2, aes(x=med_cost, y=AME)) +
+  geom_errorbar(aes(ymin=lower, ymax=upper), width = 0.5) +
+  geom_line() +
+  geom_point() +
+  geom_hline(yintercept = 0, linetype="dotted") +
+  labs(x        = "Program Requirements",
+       y        = "AME of Program Requirements",
+       title    = "Graph 2: Average Marginal Effect (AME) of Program Requirements on P(Alive)",
+       subtitle = "at important quantiles of Program Requirements, with 95% CI's") +
+  theme(legend.position="bottom") +
+  theme_bw()
+```
+
+```{r}
+## Average Marginal effect of Program Requirement at several levels of Idiosyncratic Fit
+quantlist.fit <- quantile(final.df$idiosync.fit, probs = c(0, 0.05, 0.25, 0.5, 0.75, 0.95, 1))
+quantlist.rew <- quantile(final.df$med_cost, probs = c(0.05, 0.25, 0.5, 0.75, 0.95))
+
+summ.margins.1.2.1 <- summary(margins(mdl.1.2, 
+        data = data.frame(final.df),
+        at = list(idiosync.fit = round(quantlist.fit, 1),
+                  med_cost = round(quantlist.rew, 1)),
+        variables = "med_cost",
+        type = "response"))
+
+gg.AMEint <- ggplot(data=summ.margins.1.2.1, aes(x=idiosync.fit, y=AME, color=factor(med_cost))) +
+  geom_errorbar(aes(ymin=lower, ymax=upper), width = 0.5) +
+  geom_line() +
+  geom_point() +
+  geom_hline(yintercept = 0, linetype="dotted") +
+  labs(x        = "Idiosyncratic Fit",
+       y        = "AME of Program Requirements",
+       color    = "Program Requirements",
+       title    = "Graph 3: AME of Program Requirements on P(Alive)",
+       subtitle = "at important quantiles of both Program Requirements and Idiosyncratic Fit, with 95% CI's") +
+  theme_bw() +
+  theme(legend.position="bottom")
+```
+
+```{r}
+## Predictive Margins
+predictions.1.2 <- summary(prediction(mdl.1.2, 
+                              data = data.frame(final.df),
+                              at = list(idiosync.fit = round(quantlist.fit, 1),
+                                        med_cost = round(quantlist.rew, 1))))
+
+gg.predmean <- ggplot(data=predictions.1.2, 
+                      aes(x=`at(med_cost)`, y=Prediction, color=factor(`at(idiosync.fit)`))) +
+  geom_line() +
+  geom_point() +
+  geom_hline(yintercept = 0, linetype="dotted") +
+  labs(x        = "Program Requirements",
+       y        = "E(P(Alive))",
+       color    = "Idiosyncratic Fit",
+       title    = "Graph 4: Predictive Margins of P(Alive)",
+       subtitle = "at important quantiles of both Program Requirements and Idiosyncratic Fit") +
+  theme_bw()
+```
+
+```{r}
+## Create the plots
+graphs <- (gg.AMEfit + gg.AMEratio) / (gg.AMEint + gg.predmean)
+
+graphs
+```
+
+```{r}
+## Calculate the difference in Predictive Margins for an increase in Program Requirements from 25th to 75th percentile, for different levels of Idiosyncratic fit
+summ.predictions.1.2 <- predictions.1.2 %>% 
+  group_by(`at(idiosync.fit)`) %>% filter(row_number() %in% c(3, 5)) %>%
+  summarise(pct.difference = round(last(Prediction) / first(Prediction) - 1 , 3),
+            abs.difference = round(last(Prediction) - first(Prediction), 3))
+
+summ.predictions.1.2
+
+stargazer(summ.predictions.1.2, summary = FALSE)
+```
+
+
+
+

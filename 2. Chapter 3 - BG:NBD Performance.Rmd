@@ -1,0 +1,312 @@
+---
+title: "Test Performance of the BG/NBD Model"
+output: html_notebook
+---
+
+```{r echo = TRUE, warning = FALSE}
+suppressPackageStartupMessages({
+  library("bigrquery")
+  library("dplyr")
+  library("CLVTools")
+  library("ggplot2")
+  library("DescTools")
+  library("ddpcr")
+  library("tidymodels")
+  library("stargazer")
+  library("patchwork")
+})
+```
+
+To model the expected transactions and expected average spending, as well as the the likelihood of a consumer staying in a program, the BG/NBD model by Fader et al. (2005) is applied to the transactional data. This model is an extension of earlier versions of models that were developed for customer-base analysis, such as the Pareto/NBD model as developed by Schmittlein et al. (1987). These models aim to make forecasts about future purchasing behavior (and therefore 'customer lifetime value') of individual customers within a customer base given information about the 'frequency' and 'recency' of customers past purchases. The BG/NBD model is based on five core assumptions. Assumptions 1 and 2 address the customer's buying behavior, whereas assumptions 3 and 4 address the customer's dropout behavior:
+
+1.  While active, the number of transactions made by a customer follows a Poisson process with transaction rate $\lambda$. This is equivalent to assuming that the time between transactions is distributed exponential with transaction rate $\lambda$, i.e,
+
+    $f(t_j | t_{j-1};\lambda) = \lambda e^{-\lambda(t_j-t_{j-1})},$ $t_j > t_{j-1} \ge 0$
+
+2.  Heterogeneity in $\lambda$ follows a gamma distribution with probability distribution function:
+
+    $f(\lambda|r,\alpha) = \frac{\alpha^r\lambda^{r-1}e^{-\lambda\alpha}}{\Gamma(r)}$
+
+3.  After any transaction, a customer becomes inactive with probability $p$. Therefore the point at which the customer "drops out" is distributed across transactions according to a (shifted) geometric distribution with probability mass function:
+
+    $P$(inactive immediately after $j$th transaction) = $p(1-p)^{j-1}$, $j = 1,2,3,...$
+
+4.  Heterogeneity in $p$ follows a beta distribution with probability distribution function:
+
+    $f(p|a,b)=\frac{p^{a-1}(1-p)^{b-1}}{B(a,b)}, 0 \leq p \leq 1$,
+
+    where $B(a,b)$ is the beta function, which can be expressed in terms of gamma functions: $B(a,b) = \Gamma(a)\Gamma(b)/(\Gamma(a+b)$.
+
+5.  The transaction rate $\lambda$ and the dropout probability $p$ vary independently across customers.
+
+```{r}
+# Load data
+load() # transactions_df
+load()
+```
+
+
+```{r}
+test.performance <- function(transactions_df, sh_id, split.date){
+      
+      performance   <- data.frame(matrix(ncol=26, nrow=0))
+      
+      names(performance) <- c("shop_id",
+                              "cohort",
+                              "total_customers",
+                              "total_transactions",
+                              "avg_transactions",
+                              "correlations",
+                              "MAE.CET",
+                              "MAE.0", "n0",
+                              "MAE.1", "n1",
+                              "MAE.2", "n2",
+                              "MAE.3", "n3",
+                              "MAE.4", "n4",
+                              "MAE.g5", "n5",
+                              "MAE.PMS",
+                              "r",
+                              "alpha",
+                              "a",
+                              "b",
+                              "KKT1",
+                              "KKT2")
+      
+      count <- 0
+      
+      for (shop in sh_id) {
+        
+        count <- count + 1 # Create a counter that indicates the progress
+        print(paste0(count, ": shop_id ", shop)) # Print the progress
+        
+        temp.shop.df <- transactions_df %>%
+          mutate(date = as.Date(created_at, format="%Y-%m-%d", origin = "1970-01-01")) %>% # Convert date to correct time format
+          filter((shop_id == shop) & # Only keep the transactions of one single shop, used for further calculations
+                 (purchase_amount > 0.99)) %>% # Only keep the transactions larger than one euro
+          dplyr::select(c(loyalty_program_id, shop_id, member_id, 
+                          created_at, purchase_amount, date)) # Remove redundant columns
+      
+        ## Remove rows where 'member_id', 'credits' or 'purchase_amount' is NA
+        temp.shop.df <- temp.shop.df[complete.cases(temp.shop.df$member_id),]
+        temp.shop.df <- temp.shop.df[complete.cases(temp.shop.df$purchase_amount),]
+          
+        ## Winsorize to get out the extreme values - these are very likely to be faulty data
+        temp.shop.df <- temp.shop.df %>%
+          mutate(purchase_amount = Winsorize(temp.shop.df$purchase_amount, probs = c(0, 0.99)))   
+      
+        ## Order by 'member_id' and 'created_at' - 'created_at' is more precise than 'date'
+        temp.shop.df <- temp.shop.df[order(temp.shop.df$member_id, temp.shop.df$created_at),]
+          
+        temp.shop.df <- temp.shop.df %>%
+          group_by(member_id) %>%
+          filter(n_distinct(date) > 1) %>% # Each customer should have at least two transactions in order for the model to work
+          mutate(quarter = paste(format(min(date), format="%Y"), quarters(min(date)), sep="-")) %>% # Create quarters of first transaction for cohort creation
+          ungroup()
+          
+        # Create a list of unique quarters, and remove the last quarter (there are not likely to be enough customers in this quarter)
+        quarterlist <- unique(temp.shop.df$quarter)
+        quarterlist <- quarterlist[quarterlist != "2022-Q2"]
+        
+        if (length(unique(temp.shop.df$member_id)) > 500) { # Only select shops with more than 500 customers for accuracy
+          if ((max(temp.shop.df$date) - min(temp.shop.df$date)) > 365) { # Only select shops with more than 365 active days for accuracy
+            
+            for (cohort in sort(quarterlist)){
+                  
+              # Filter out the transactions for the specific cohort
+              cohort_df <- temp.shop.df %>% filter(quarter == cohort)
+              
+              # Filter out the customers that have their first transaction in the holdout period
+              cohort_df <- cohort_df %>% group_by(member_id) %>%
+                filter(min(date) < as.Date(split.date))
+              
+              if (max(cohort_df$date) - min(cohort_df$date) > 7 & min(cohort_df$date) < (as.Date(split.date)-7)){
+            
+                if (max(as.Date(cohort_df$date)) > as.Date("2022-04-12")){
+                
+                  # Create a CLV object
+                  temp.clv <- clvdata(cohort_df,
+                                      date.format = "ymd",
+                                      time.unit = "week",
+                                      estimation.split = as.Date(split.date),
+                                      name.id = "member_id",
+                                      name.date = "date",
+                                      name.price = "purchase_amount")
+                  
+                  # Alter the end date of the holdout period to be 2022-04-26"
+                  temp.clv@clv.time@timepoint.holdout.end <- as.Date("2022-04-26")
+                  
+                  set.seed(1)
+                       
+                  ## Estimate the model parameters
+                  quiet(
+                  temp.est.bgnbd <- bgnbd(temp.clv, 
+                                          start.params.model = c(r=0.275, 
+                                                                 alpha=3.287,
+                                                                 a=0.355, 
+                                                                 b=2.360),
+                                          optimx.args = list(method="Nelder-Mead")))
+                  
+                  temp.kkt1 <- temp.est.bgnbd@optimx.estimation.output[["kkt1"]]
+                  temp.kkt2 <- temp.est.bgnbd@optimx.estimation.output[["kkt2"]]
+                  temp.conv <- temp.est.bgnbd@optimx.estimation.output[["convcode"]]
+                  
+                  # Check if optimization conditions are met
+                  if (is.na(temp.kkt1)){
+                    temp.kkt1 <- FALSE
+                  }
+                  
+                  if (is.na(temp.kkt2)){
+                    temp.kkt2 <- FALSE
+                  }
+                  
+                  if (temp.kkt1 == TRUE & temp.kkt2 == TRUE & temp.conv == 0) {
+                    
+                    # Create the predictions, if the optimization conditions are met
+                    quiet(
+                    temp.results <- tryCatch(predict(temp.est.bgnbd, prediction.end = 4), error = function(e) e)
+                    )
+                        
+                    if(!inherits(temp.results, "error")) {
+                      
+                      print(paste0(count,": calculating ", cohort))
+                      
+                      # Create subsets to calculate MAE at different levels
+                      temp.0 <- filter(temp.results, round(CET, 0) == 0)
+                      temp.1 <- filter(temp.results, round(CET, 0) == 1)
+                      temp.2 <- filter(temp.results, round(CET, 0) == 2)
+                      temp.3 <- filter(temp.results, round(CET, 0) == 3)
+                      temp.4 <- filter(temp.results, round(CET, 0) == 4)
+                      temp.g5 <- filter(temp.results, round(CET, 0) > 4)
+                      
+                      temp.results$actual.mean.spending <- temp.results$actual.total.spending / temp.results$actual.x
+                      temp.results$actual.mean.spending[is.na(temp.results$actual.mean.spending)] <- 0
+                      
+                      ## Create a dataframe with all the performance measures on shop level
+                      temp.performance <- list(
+                                shop_id = shop,
+                                cohort = cohort,
+                                total_customers = length(temp.results$Id),
+                                total_transactions = sum(temp.results$actual.x),
+                                avg_transactions = sum(temp.results$actual.x) / length(temp.results$Id),
+                                correlation = cor(temp.results$actual.x, temp.results$CET),
+                                MAE.CET = MAE(temp.results$CET, temp.results$actual.x),
+                                RMSE.CET = RMSE(temp.results$CET, temp.results$actual.x),
+                                MAE.0 = MAE(temp.0$CET, temp.0$actual.x), n0 = nrow(temp.0),
+                                MAE.1 = MAE(temp.1$CET, temp.1$actual.x), n1 = nrow(temp.1),
+                                MAE.2 = MAE(temp.2$CET, temp.2$actual.x), n2 = nrow(temp.2),
+                                MAE.3 = MAE(temp.3$CET, temp.3$actual.x), n3 = nrow(temp.3),
+                                MAE.4 = MAE(temp.4$CET, temp.4$actual.x), n4 = nrow(temp.4),
+                                MAE.g5 = MAE(temp.g5$CET, temp.g5$actual.x), n5 = nrow(temp.g5),
+                                MAE.PMS = MAE(temp.results$predicted.mean.spending, temp.results$actual.mean.spending),
+                                r = temp.est.bgnbd@prediction.params.model["r"],
+                                alpha = temp.est.bgnbd@prediction.params.model["alpha"],
+                                a = temp.est.bgnbd@prediction.params.model["a"],
+                                b = temp.est.bgnbd@prediction.params.model["b"],
+                                KKT1 = temp.est.bgnbd@optimx.estimation.output$kkt1,
+                                KKT2 = temp.est.bgnbd@optimx.estimation.output$kkt2)
+            
+                      temp.performance <- as.data.frame(temp.performance)
+                      
+                      performance <- rbind(performance, temp.performance)
+                      
+                    }else{print(paste0(count, ": ",cohort, " not predicted: that weird error"))}
+                  }else{print(paste0(count, ": ",cohort, " not predicted: kkt or conv not met"))}
+                }else{print(paste0(count, ": ",cohort, " not predicted: no recent transactions"))}
+              }else{print(paste0(count, ": ",cohort, " not predicted: less than a week"))}
+            }
+          }else{print(paste0(count, ": shop_id ",shop, " not predicted: exists for less than a year"))}
+        }else{print(paste0(count, ": shop_id ",shop, " not predicted: too little members"))}
+      }
+      
+      return(performance)
+}
+```
+
+```{r}
+# Estimate the performance for the three holdout periods
+performance.4weeks  <- test.performance(transactions_df, sh_id, split.date = as.Date("2022-04-26")-28)
+performance.8weeks  <- test.performance(transactions_df, sh_id, split.date = as.Date("2022-04-26")-56)
+performance.16weeks <- test.performance(transactions_df, sh_id, split.date = as.Date("2022-04-26")-112)
+```
+
+```{r}
+## Show statistics of the performance dataframe
+performance.4weeks %>% 
+  summarise(`number of loyalty programs` = length(unique(shop_id)),
+            `total number of cohorts` = nrow(performance.4weeks),
+            `total number customers` = sum(total_customers),
+            `total actual transactions in holdout period` = sum(total_transactions),
+            `first transaction` = sort(unique(cohort))[1]) %>% gather()
+
+performance.8weeks %>% 
+  summarise(`number of loyalty programs` = length(unique(shop_id)),
+            `total number of cohorts` = nrow(performance.8weeks),
+            `total number customers` = sum(total_customers),
+            `total actual transactions in holdout period` = sum(total_transactions),
+            `first transaction` = sort(unique(cohort))[1]) %>% gather()
+
+performance.16weeks %>% 
+  summarise(`number of loyalty programs` = length(unique(shop_id)),
+            `total number of cohorts` = nrow(performance.16weeks),
+            `total number customers` = sum(total_customers),
+            `total actual transactions in holdout period` = sum(total_transactions),
+            `first transaction` = sort(unique(cohort))[1]) %>% gather()
+```
+
+```{r}
+# Performance of the three holdout periods
+performance.4weeks %>% dplyr::select(c(3, 6, 7, 9:20)) %>%
+  mutate(wCor = correlation*total_customers/sum(total_customers),
+         wMAE.CET = MAE.CET*total_customers/sum(total_customers),
+         wMAE.0 = MAE.0*n0/sum(n0),
+         wMAE.1 = MAE.1*n1/sum(n1),
+         wMAE.2 = MAE.2*n2/sum(n2),
+         wMAE.3 = MAE.3*n3/sum(n3),
+         wMAE.4 = MAE.4*n4/sum(n4),
+         wMAE.g5 = MAE.g5*n5/sum(n5)) %>%
+  summarise(Correlation = sum(wCor, na.rm=TRUE),
+            MAE.CET = sum(wMAE.CET, na.rm=TRUE),
+            MAE.0 = sum(wMAE.0, na.rm=TRUE),
+            MAE.1 = sum(wMAE.1, na.rm=TRUE),
+            MAE.2 = sum(wMAE.2, na.rm=TRUE),
+            MAE.3 = sum(wMAE.3, na.rm=TRUE),
+            MAE.4 = sum(wMAE.4, na.rm=TRUE),
+            MAE.g5 = sum(wMAE.g5, na.rm=TRUE)) %>% gather()
+
+performance.8weeks %>% dplyr::select(c(3, 6, 7, 9:20)) %>%
+  mutate(wCor = correlation*total_customers/sum(total_customers),
+         wMAE.CET = MAE.CET*total_customers/sum(total_customers),
+         wMAE.0 = MAE.0*n0/sum(n0),
+         wMAE.1 = MAE.1*n1/sum(n1),
+         wMAE.2 = MAE.2*n2/sum(n2),
+         wMAE.3 = MAE.3*n3/sum(n3),
+         wMAE.4 = MAE.4*n4/sum(n4),
+         wMAE.g5 = MAE.g5*n5/sum(n5)) %>%
+  summarise(Correlation = sum(wCor, na.rm=TRUE),
+            MAE.CET = sum(wMAE.CET, na.rm=TRUE),
+            MAE.0 = sum(wMAE.0, na.rm=TRUE),
+            MAE.1 = sum(wMAE.1, na.rm=TRUE),
+            MAE.2 = sum(wMAE.2, na.rm=TRUE),
+            MAE.3 = sum(wMAE.3, na.rm=TRUE),
+            MAE.4 = sum(wMAE.4, na.rm=TRUE),
+            MAE.g5 = sum(wMAE.g5, na.rm=TRUE)) %>% gather()
+
+performance.16weeks %>% dplyr::select(c(3, 6, 7, 9:20)) %>%
+  mutate(wCor = correlation*total_customers/sum(total_customers),
+         wMAE.CET = MAE.CET*total_customers/sum(total_customers),
+         wMAE.0 = MAE.0*n0/sum(n0),
+         wMAE.1 = MAE.1*n1/sum(n1),
+         wMAE.2 = MAE.2*n2/sum(n2),
+         wMAE.3 = MAE.3*n3/sum(n3),
+         wMAE.4 = MAE.4*n4/sum(n4),
+         wMAE.g5 = MAE.g5*n5/sum(n5)) %>%
+  summarise(Correlation = sum(wCor, na.rm=TRUE),
+            MAE.CET = sum(wMAE.CET, na.rm=TRUE),
+            MAE.0 = sum(wMAE.0, na.rm=TRUE),
+            MAE.1 = sum(wMAE.1, na.rm=TRUE),
+            MAE.2 = sum(wMAE.2, na.rm=TRUE),
+            MAE.3 = sum(wMAE.3, na.rm=TRUE),
+            MAE.4 = sum(wMAE.4, na.rm=TRUE),
+            MAE.g5 = sum(wMAE.g5, na.rm=TRUE)) %>% gather()
+```
+
