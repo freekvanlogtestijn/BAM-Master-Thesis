@@ -1,7 +1,32 @@
 ---
-title: "Chapter 4: The idiosyncratic fit heuristic"
+title: "Chapter 4: The Idiosyncratic Fit Heuristic"
 output: html_notebook
 ---
+
+```{r}
+suppressPackageStartupMessages({
+  library("bigrquery")
+  library("dplyr")
+  library("CLVTools")
+  library("ggplot2")
+  library("DescTools")
+  library("ddpcr")
+  library("tidymodels")
+  library("NbClust")
+  library("GGally")
+  library("stringr")
+  library("ggtext")
+  library("betareg")
+  library("fitdistrplus")
+  library("corrplot")
+  library("mgcv")
+  library("margins")
+  library("lmtest")
+  library("stargazer")
+  library("patchwork")
+  library("prediction")
+})
+```
 
 Using BG/NBD model, for each of the loyalty programs which have 500 members or more and are active for at least one year (365 days), the individual customer metrics are estimated. The estimations are made for each loyalty program separately so that the parameters $r, \alpha, a$ and $b$ are estimated separately for each loyalty program.
 
@@ -165,20 +190,20 @@ indiv.metrics <- function.indiv.metrics(transactions_df, sh_id, 28)
 After the creation of the individual level metrics, some characteristics from each loyalty program need to be created in order to simulate the program requirements. Since most programs have multiple rewards that can be redeemed within their program in exchange for credits, multiple metrics are extracted from the data. These metrics include the minimum, median, and maximum of the required credits, the required credits divided by the average spending at the store, and the required credits divided by the cost price of the reward (the ratio of credits per euro of cost price). Furthermore, the ratio of credits per euro of cost price is also segmented into four categories.
 
 ```{r}
-rewards_df <- merge(rewards_df, 
+rewards_df.ch4 <- merge(rewards_df, 
                     indiv.metrics %>% 
                       group_by(shop_id, loyalty_program_id) %>% 
                       summarize(mean.PMS = mean(shop.PMS)),
                     by = 'loyalty_program_id')
 
 # Filter out free rewards and create required credits / cost price ratio
-rewards_df <- rewards_df %>%
+rewards_df.ch4 <- rewards_df.ch4 %>%
       filter(required_credits > 0) %>%
       mutate(relative_cost = required_credits / cost_price)
 ```
 
 ```{r}
-reward_structures <- rewards_df %>% distinct(shop_id, title, .keep_all = TRUE) %>%
+reward_structures.ch4 <- rewards_df.ch4 %>%
       group_by(shop_id) %>%
       summarise(num_rewards = n(),
              min_reward = min(required_credits),
@@ -194,7 +219,7 @@ The final data frame is constructed by merging the individual consumer metrics w
 ```{r}
 ## Create final data frame
 final.df <- merge(indiv.metrics[,c('shop_id', 'loyalty_program_id', 'member_id', 'PAlive', 'idiosync.fit')],
-                  reward_structures,
+                  reward_structures.ch4,
                   by = 'shop_id')
 
 final.df <- final.df %>%
@@ -206,13 +231,15 @@ final.df <- final.df %>% filter(!is.infinite(med_cost) & !is.infinite(max_cost))
 ```{r}
 ## Look at the correlation
 final.df %>% dplyr::select(PAlive, idiosync.fit, med_cost) %>%
-  cor() %>% corrplot(method="number")
+  cor()
 ```
 
 ```{r}
 ## Look at the summary statistics
 final.df %>% dplyr::select(PAlive, idiosync.fit, med_cost) %>%
   summary()
+
+stargazer(final.df %>% dplyr::select(PAlive, idiosync.fit, med_cost), type = 'text')
 ```
 
 ```{r}
@@ -354,8 +381,6 @@ summ.predictions.1.2 <- predictions.1.2 %>%
             abs.difference = round(last(Prediction) - first(Prediction), 3))
 
 summ.predictions.1.2
-
-stargazer(summ.predictions.1.2, summary = FALSE)
 ```
 
 

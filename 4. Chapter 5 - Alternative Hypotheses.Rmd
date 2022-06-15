@@ -371,7 +371,7 @@ rewards_df <- rewards_df %>%
 
 ```{r}
 ## Create reward structures
-reward_structures <- rewards_df %>% distinct(loyalty_program_id, title, .keep_all = TRUE) %>%
+reward_structures.ch5 <- rewards_df %>%
       group_by(loyalty_program_id) %>% 
       summarise(num_rewards = n(),
              min_reward = min(required_credits),
@@ -398,7 +398,7 @@ shop.members <- cross.measures %>% group_by(shop_id) %>%
 
 ```{r}
 ## Create dataframe of cross-section of measures and reward_structures
-final.df.shop_segment <- merge(cross.measures.long, reward_structures, by = "loyalty_program_id")
+final.df.shop_segment <- merge(cross.measures.long, reward_structures.ch5, by = "loyalty_program_id")
 
 final.df.shop_segment <- merge(merge(final.df.shop_segment, shop.length, by = "shop_id"),
                                shop.members, by = "shop_id")
@@ -414,13 +414,18 @@ final.df.segments$CET.wins <- Winsorize(final.df.segments$CET, probs = (c(0.025,
 ```{r}
 ## Look at correlations
 final.df.segments %>% dplyr::select(PAlive, CET.wins, log.min_reward, min_relative, num_rewards, days_active, members) %>%
-  cor() %>% corrplot(method="number")
+  cor()
+
+stargazer(final.df.segments %>% dplyr::select(PAlive, CET.wins, log.min_reward, min_relative, num_rewards, days_active, members) %>%
+  cor())
 ```
 
 ```{r}
 ## Look at the summary statistics
 final.df.segments %>% dplyr::select(PAlive, CET.wins, log.min_reward, min_relative, num_rewards, days_active, members) %>%
   summary()
+
+stargazer(final.df.segments %>% dplyr::select(PAlive, CET.wins, log.min_reward, min_relative, num_rewards, days_active, members), type = "text")
 ```
 
 ```{r}
